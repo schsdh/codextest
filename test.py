@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from datetime import datetime, timedelta, timezone
+import aiohttp
 
 
 
@@ -17,7 +18,7 @@ def get_token() -> str:   ## askurl console 작업에 필요한 로그인 토큰
     host = "console.askurl.io"
     path = "/api/v1/users/auth"
 
-    payload = '{"platform":"nurilab","authCode":"","email":"asdfasdfasdfasdf","password":"asdfasdfasdfasdf"}'
+    payload = '{"platform":"nurilab","authCode":"","email":"asdfasdfasdf","password":"asdfasdfasdfasdf"}'
     body_bytes = payload.encode("utf-8")
     content_length = str(len(body_bytes))
 
@@ -212,6 +213,67 @@ async def request_search(console_token: str) -> None:
     await asyncio.gather(*tasks)
 
 
+async def check_FR(session: aiohttp.ClientSession, data: dict, queue: asyncio.Queue) -> None:
+    url_id = data.get("url_id")
+    if not url_id:
+        return
+    url = f"https://console.askurl.io/api/v1/scanresults/{url_id}/summary"
+    headers = {
+        "X-ACCESS-TOKEN": console_token,
+        "X-APIKEY": "db79c45b-1a60-4afc-9410-f2f0e2b0247a",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "identity",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    }
+    async with session.get(url, headers=headers) as resp:
+        resp.raise_for_status()
+        text = await resp.text()
+        try:
+            js = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        detections = js.get("detections")
+        if isinstance(detections, list):
+            filtered = [d for d in detections if d.get("scanner_id") != "fixedresult"]
+            if filtered:
+                js["detections"] = filtered
+                await queue.put(js)
+
+
+async def temp_logger(queue: asyncio.Queue) -> None:
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        print(json.dumps(item, ensure_ascii=False))
+        queue.task_done()
+
+
+async def process_saved_results() -> None:
+    file_path = Path(__file__).resolve().parent / "request_result.txt"
+    if not file_path.exists():
+        return
+
+    rows: list[dict] = []
+    with file_path.open("r", encoding="utf-8") as rf:
+        for line in rf:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    async with aiohttp.ClientSession() as session:
+        queue: asyncio.Queue = asyncio.Queue()
+        logger_task = asyncio.create_task(temp_logger(queue))
+        tasks = [check_FR(session, row, queue) for row in rows]
+        await asyncio.gather(*tasks)
+        await queue.put(None)
+        await logger_task
+
+
 
 
 
@@ -220,8 +282,11 @@ async def request_search(console_token: str) -> None:
 
 
 console_token = get_token()  ##전역변수 console_token에 토큰 획득해서 저장
-asyncio.run(request_search(console_token))
 
 
+async def main() -> None:
+    await request_search(console_token)
+    await process_saved_results()
 
 
+asyncio.run(main())
