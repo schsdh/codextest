@@ -213,7 +213,7 @@ async def request_search(console_token: str) -> None:
     await asyncio.gather(*tasks)
 
 
-async def check_FR(session: aiohttp.ClientSession, data: dict) -> None:
+async def check_FR(session: aiohttp.ClientSession, data: dict, queue: asyncio.Queue) -> None:
     url_id = data.get("url_id")
     if not url_id:
         return
@@ -228,7 +228,25 @@ async def check_FR(session: aiohttp.ClientSession, data: dict) -> None:
     async with session.get(url, headers=headers) as resp:
         resp.raise_for_status()
         text = await resp.text()
-        print(text)
+        try:
+            js = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        detections = js.get("detections")
+        if isinstance(detections, list):
+            filtered = [d for d in detections if d.get("scanner_id") != "fixedresult"]
+            if filtered:
+                js["detections"] = filtered
+                await queue.put(js)
+
+
+async def temp_logger(queue: asyncio.Queue) -> None:
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        print(json.dumps(item, ensure_ascii=False))
+        queue.task_done()
 
 
 async def process_saved_results() -> None:
@@ -248,8 +266,12 @@ async def process_saved_results() -> None:
                 continue
 
     async with aiohttp.ClientSession() as session:
-        tasks = [check_FR(session, row) for row in rows]
+        queue: asyncio.Queue = asyncio.Queue()
+        logger_task = asyncio.create_task(temp_logger(queue))
+        tasks = [check_FR(session, row, queue) for row in rows]
         await asyncio.gather(*tasks)
+        await queue.put(None)
+        await logger_task
 
 
 
